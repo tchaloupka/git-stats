@@ -718,6 +718,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .scan-info { margin-top: 1rem; font-size: 0.9rem; }
 .empty-msg { text-align: center; padding: 3rem; color: var(--subtitle); }
+.print-img { display: none; }
 @media print {
     header { background: none; color: black; padding: 0.5rem 0; }
     .header-btn, .controls { display: none; }
@@ -725,10 +726,22 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     body { background: white; }
     main { max-width: none; padding: 0; }
     .card, .pie-card { box-shadow: none; border: 1px solid #ddd; break-inside: avoid; }
-    .chart-container { height: 320px; }
+    /* Canvases neither scale to the print layout (no responsive resize for
+       print media) nor survive orientation changes - print a snapshot image
+       instead, it follows the page width naturally */
+    /* !important: Chart.js sets display inline on the canvas */
+    .chart-container canvas, .pie-container canvas { display: none !important; }
+    .chart-container, .pie-container { height: auto; }
+    .print-img { display: block; width: 100%; }
     .pie-grid { grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
     .pie-card { padding: 0.75rem; }
     .legend-item { cursor: default; }
+    /* Heatmap cells and legend dots are pure CSS backgrounds - without this
+       browsers drop them unless "print backgrounds" is enabled */
+    .hm-cell, .legend-dot {
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+    }
 }
 </style>
 </head>
@@ -959,15 +972,24 @@ function setupControls() {
         printMode = true;
         printWasDark = isDark();
         if (printWasDark) document.documentElement.setAttribute('data-theme', '');
+        // Re-render at 3x pixel ratio and snapshot each chart into an <img>
+        // shown only in print (see .print-img CSS)
         renderAll();
-        // Print layout is narrower than screen and responsive resize does not
-        // run for print media - force a printable size explicitly
-        if (timeChart) timeChart.resize(640, 300);
-        Object.values(pieCharts).forEach(c => c.resize(130, 130));
+        document.querySelectorAll('.print-img').forEach(i => i.remove());
+        const snapshot = chart => {
+            if (!chart) return;
+            const img = document.createElement('img');
+            img.className = 'print-img';
+            img.src = chart.toBase64Image();
+            chart.canvas.parentElement.appendChild(img);
+        };
+        snapshot(timeChart);
+        Object.values(pieCharts).forEach(snapshot);
     });
     window.addEventListener('afterprint', () => {
         printMode = false;
         if (printWasDark) document.documentElement.setAttribute('data-theme', 'dark');
+        document.querySelectorAll('.print-img').forEach(i => i.remove());
         renderAll();
     });
 }
@@ -1144,6 +1166,7 @@ function renderTimeChart() {
             responsive: true,
             maintainAspectRatio: false,
             animation: printMode ? false : undefined,
+            devicePixelRatio: printMode ? 3 : undefined,
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { display: false },
@@ -1206,6 +1229,7 @@ function renderPieCharts() {
             options: {
                 responsive: true,
                 animation: printMode ? false : undefined,
+                devicePixelRatio: printMode ? 3 : undefined,
                 plugins: {
                     legend: { display: false },
                     tooltip: {
