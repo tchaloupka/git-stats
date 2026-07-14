@@ -11,6 +11,8 @@
 - Rescan button in UI + `POST /api/rescan` endpoint (full rescan without restart).
 - Scan progress with total and percentage.
 - UI localization by browser locale (Czech, fallback English).
+- Hovering an author in the legend highlights their line in the chart
+  (others are dimmed, the trend line too).
 - Automatic port fallback: if the port is busy, the next free one (up to +49) is used.
 
 ### Changed

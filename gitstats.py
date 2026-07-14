@@ -854,6 +854,7 @@ let showTrend = true;
 let activeAuthors = new Set();
 // Deactivated authors survive period switches; unknown (new) authors start active
 let inactiveAuthors = new Set();
+let hoverAuthor = null;
 let chartData = null;
 let timeChart = null;
 let pieCharts = {};
@@ -1007,8 +1008,39 @@ function buildLegend() {
             }
             renderAll();
         });
+        item.addEventListener('mouseenter', () => {
+            hoverAuthor = author.name;
+            updateHighlight();
+        });
+        item.addEventListener('mouseleave', () => {
+            hoverAuthor = null;
+            updateHighlight();
+        });
         el.appendChild(item);
     });
+}
+
+function updateHighlight() {
+    if (!timeChart) return;
+    const dimTrend = isDark() ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)';
+    const fullTrend = isDark() ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.4)';
+    timeChart.data.datasets.forEach(ds => {
+        if (ds.isTrend) {
+            ds.borderColor = hoverAuthor ? dimTrend : fullTrend;
+            return;
+        }
+        if (!hoverAuthor) {
+            ds.borderColor = ds.baseColor;
+            ds.borderWidth = 2;
+        } else if (ds.label === hoverAuthor) {
+            ds.borderColor = ds.baseColor;
+            ds.borderWidth = 4;
+        } else {
+            ds.borderColor = ds.baseColor + '2e';
+            ds.borderWidth = 2;
+        }
+    });
+    timeChart.update('none');
 }
 
 function updateLegendStyles() {
@@ -1037,6 +1069,7 @@ function renderTimeChart() {
         .map(a => ({
             label: a.name,
             data: chartData.timeseries.data[a.name][currentMetric],
+            baseColor: a.color,
             borderColor: a.color,
             backgroundColor: a.color + '18',
             borderWidth: 2,
@@ -1056,6 +1089,7 @@ function renderTimeChart() {
         datasets.push({
             label: L.trendTotal,
             data: trendData,
+            isTrend: true,
             borderColor: trendColor,
             backgroundColor: 'transparent',
             borderWidth: 3,
@@ -1100,6 +1134,8 @@ function renderTimeChart() {
             }
         }
     });
+    // Re-apply hover highlight when the chart is rebuilt under the cursor
+    if (hoverAuthor) updateHighlight();
 }
 
 function renderPieCharts() {
