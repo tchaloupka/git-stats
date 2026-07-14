@@ -718,6 +718,18 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .scan-info { margin-top: 1rem; font-size: 0.9rem; }
 .empty-msg { text-align: center; padding: 3rem; color: var(--subtitle); }
+@media print {
+    header { background: none; color: black; padding: 0.5rem 0; }
+    .header-btn, .controls { display: none; }
+    .repo-name { opacity: 1; }
+    body { background: white; }
+    main { max-width: none; padding: 0; }
+    .card, .pie-card { box-shadow: none; border: 1px solid #ddd; break-inside: avoid; }
+    .chart-container { height: 320px; }
+    .pie-grid { grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+    .pie-card { padding: 0.75rem; }
+    .legend-item { cursor: default; }
+}
 </style>
 </head>
 <body>
@@ -754,6 +766,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
             </div>
             <div class="btn-group">
                 <a id="exportLink" href="/api/export?period=month" download>Export CSV</a>
+                <button id="pdfBtn">PDF</button>
             </div>
         </div>
         <div id="emptyMsg" class="card empty-msg" style="display:none"></div>
@@ -805,6 +818,7 @@ const LANGS = {
         heatmapTitle: 'Activity by day and hour (commits, author local time)',
         trendTotal: 'Trend (total)',
         rescanTitle: 'Rescan repository', themeTitle: 'Toggle dark/light mode',
+        pdfTitle: 'Print / save as PDF',
         days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
         locale: 'en-US',
     },
@@ -817,6 +831,7 @@ const LANGS = {
         heatmapTitle: 'Aktivita podle dne a hodiny (commity, lokální čas autora)',
         trendTotal: 'Trend (celkem)',
         rescanTitle: 'Znovu naskenovat repozitář', themeTitle: 'Přepnout tmavý/světlý režim',
+        pdfTitle: 'Tisk / uložit jako PDF',
         days: ['Po', 'Út', 'St', 'Čt', 'Pá', 'So', 'Ne'],
         locale: 'cs-CZ',
     },
@@ -831,6 +846,7 @@ function applyStrings() {
     document.getElementById('heatmapTitle').textContent = L.heatmapTitle;
     document.getElementById('rescanBtn').title = L.rescanTitle;
     document.getElementById('themeToggle').title = L.themeTitle;
+    document.getElementById('pdfBtn').title = L.pdfTitle;
     document.querySelectorAll('#periodBtns button, #metricBtns button').forEach(btn => {
         btn.textContent = L[btn.dataset.val];
     });
@@ -855,6 +871,8 @@ let activeAuthors = new Set();
 // Deactivated authors survive period switches; unknown (new) authors start active
 let inactiveAuthors = new Set();
 let hoverAuthor = null;
+let printMode = false;
+let printWasDark = false;
 let chartData = null;
 let timeChart = null;
 let pieCharts = {};
@@ -933,6 +951,23 @@ function setupControls() {
     document.getElementById('trendBtn').addEventListener('click', () => {
         showTrend = !showTrend;
         document.getElementById('trendBtn').classList.toggle('active', showTrend);
+        renderAll();
+    });
+    document.getElementById('pdfBtn').addEventListener('click', () => window.print());
+    // Print: light theme + charts without animation, restore afterwards
+    window.addEventListener('beforeprint', () => {
+        printMode = true;
+        printWasDark = isDark();
+        if (printWasDark) document.documentElement.setAttribute('data-theme', '');
+        renderAll();
+        // Print layout is narrower than screen and responsive resize does not
+        // run for print media - force a printable size explicitly
+        if (timeChart) timeChart.resize(640, 300);
+        Object.values(pieCharts).forEach(c => c.resize(130, 130));
+    });
+    window.addEventListener('afterprint', () => {
+        printMode = false;
+        if (printWasDark) document.documentElement.setAttribute('data-theme', 'dark');
         renderAll();
     });
 }
@@ -1108,6 +1143,7 @@ function renderTimeChart() {
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            animation: printMode ? false : undefined,
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { display: false },
@@ -1169,6 +1205,7 @@ function renderPieCharts() {
             },
             options: {
                 responsive: true,
+                animation: printMode ? false : undefined,
                 plugins: {
                     legend: { display: false },
                     tooltip: {

@@ -41,6 +41,7 @@ A browser opens automatically at `http://127.0.0.1:8787` (or the next free port)
 - **Metric switching**: commits, added lines, deleted lines, total changes
 - **Clickable author legend** — click to toggle visibility, Ctrl+click to solo an author (Ctrl+click again to restore all)
 - **CSV export** — per-bucket, per-author rows for the selected period (Export CSV button or `GET /api/export?period=...`)
+- **PDF export** — PDF button opens the print dialog with a print-optimized layout (choose "Save as PDF"); light theme is forced so it works from dark mode too
 - **Rescan button** (↻ in header) — full rescan without restarting the server
 - **Author grouping** — authors are merged by e-mail (case-insensitive), `.mailmap` is respected; display name is the most frequent one, name collisions are disambiguated with the e-mail
 - **Dark mode** — toggle in header, respects system preference, persists choice

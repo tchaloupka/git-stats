@@ -13,6 +13,9 @@
 - UI localization by browser locale (Czech, fallback English).
 - Hovering an author in the legend highlights their line in the chart
   (others are dimmed, the trend line too).
+- PDF export: PDF button opens the browser print dialog with a dedicated
+  print layout (light theme forced, controls hidden, charts resized to
+  page width). Verified with headless Chromium print-to-PDF.
 - Automatic port fallback: if the port is busy, the next free one (up to +49) is used.
 
 ### Changed
