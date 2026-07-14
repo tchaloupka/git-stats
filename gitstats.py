@@ -272,8 +272,17 @@ def scan_repository(db_path, full=False):
 
 # --- Data Aggregation ---
 
-def get_period_start(period):
+def get_period_start(period, include_weekends=True):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if period == 'week' and not include_weekends:
+        # Last 7 working days instead of last 7 calendar days
+        d = now
+        workdays = 0
+        while workdays < 7:
+            d -= timedelta(days=1)
+            if d.weekday() < 5:
+                workdays += 1
+        return d
     days = {'week': 7, 'month': 30, 'quarter': 90, 'year': 365}.get(period)
     return now - timedelta(days=days) if days else None
 
@@ -293,7 +302,7 @@ BUCKET_SQL = {
 }
 
 
-def generate_labels(start_date, end_date, fmt):
+def generate_labels(start_date, end_date, fmt, include_weekends=True):
     labels = []
     s = start_date.date() if isinstance(start_date, datetime) else start_date
     e = end_date.date() if isinstance(end_date, datetime) else end_date
@@ -301,7 +310,8 @@ def generate_labels(start_date, end_date, fmt):
     if fmt == 'day':
         cur = s
         while cur <= e:
-            labels.append(cur.isoformat())
+            if include_weekends or cur.weekday() < 5:
+                labels.append(cur.isoformat())
             cur += timedelta(days=1)
     elif fmt == 'week':
         cur = s - timedelta(days=s.weekday())
@@ -343,17 +353,28 @@ def display_names(conn, where, params):
     return names
 
 
-def get_data(db_path, period='month'):
+def get_data(db_path, period='month', include_weekends=True):
     conn = sqlite3.connect(db_path)
-    start = get_period_start(period)
+    start = get_period_start(period, include_weekends)
     fmt = bucket_format(period)
     bucket = BUCKET_SQL[fmt]
 
-    where = ''
-    params = ()
+    conds = []
+    params = []
     if start:
-        where = 'WHERE date_utc >= ?'
-        params = (start.strftime('%Y-%m-%d %H:%M:%S'),)
+        conds.append('date_utc >= ?')
+        params.append(start.strftime('%Y-%m-%d %H:%M:%S'))
+    # Timeseries/totals bucket by UTC day, the heatmap by author-local time -
+    # the weekend condition has to match each view's notion of "day"
+    hm_conds = list(conds)
+    if not include_weekends:
+        conds.append("CAST(strftime('%w', date_utc) AS INTEGER) NOT IN (0, 6)")
+        hm_conds.append(
+            "CAST(strftime('%w', datetime(date_utc, tz_offset_min || ' minutes')) AS INTEGER)"
+            ' NOT IN (0, 6)')
+    where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
+    hm_where = ('WHERE ' + ' AND '.join(hm_conds)) if hm_conds else ''
+    params = tuple(params)
 
     minmax = conn.execute(f'SELECT MIN(date_utc), MAX(date_utc) FROM commits {where}', params).fetchone()
     if not minmax or not minmax[0]:
@@ -365,7 +386,7 @@ def get_data(db_path, period='month'):
     max_date = datetime.strptime(minmax[1], '%Y-%m-%d %H:%M:%S')
     if start and start > min_date:
         min_date = start
-    labels = generate_labels(min_date, max_date, fmt)
+    labels = generate_labels(min_date, max_date, fmt, include_weekends)
     label_idx = {lbl: i for i, lbl in enumerate(labels)}
 
     names = display_names(conn, where, params)
@@ -405,10 +426,14 @@ def get_data(db_path, period='month'):
     for email, dow, hour, c in conn.execute(
         f"SELECT email, CAST(strftime('%w', datetime(date_utc, tz_offset_min || ' minutes')) AS INTEGER), "
         f"CAST(strftime('%H', datetime(date_utc, tz_offset_min || ' minutes')) AS INTEGER), COUNT(*) "
-        f'FROM commits {where} GROUP BY 1, 2, 3',
+        f'FROM commits {hm_where} GROUP BY 1, 2, 3',
         params
     ):
-        heatmap[names[email]][(dow + 6) % 7][hour] += c
+        # The heatmap filter (local day) may cover a slightly different commit
+        # set than totals (UTC day); skip authors absent from totals
+        name = names.get(email)
+        if name in heatmap:
+            heatmap[name][(dow + 6) % 7][hour] += c
 
     conn.close()
 
@@ -421,8 +446,8 @@ def get_data(db_path, period='month'):
     }
 
 
-def export_csv(db_path, period='month'):
-    data = get_data(db_path, period)
+def export_csv(db_path, period='month', include_weekends=True):
+    data = get_data(db_path, period, include_weekends)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(['bucket', 'author', 'commits', 'additions', 'deletions', 'changes'])
@@ -480,6 +505,7 @@ class StatsHandler(BaseHTTPRequestHandler):
         period = params.get('period', ['month'])[0]
         if period not in ('week', 'month', 'quarter', 'year', 'all'):
             period = 'month'
+        weekends = params.get('weekends', ['1'])[0] != '0'
 
         if path == '/':
             self._respond(200, 'text/html; charset=utf-8', HTML_PAGE.encode())
@@ -492,9 +518,9 @@ class StatsHandler(BaseHTTPRequestHandler):
         elif path == '/api/status':
             self._json({**scan_status, 'repo': self.repo_name})
         elif path == '/api/data':
-            self._json(get_data(self.db_path, period))
+            self._json(get_data(self.db_path, period, weekends))
         elif path == '/api/export':
-            body = export_csv(self.db_path, period)
+            body = export_csv(self.db_path, period, weekends)
             self.send_response(200)
             self.send_header('Content-Type', 'text/csv; charset=utf-8')
             self.send_header('Content-Disposition',
@@ -778,6 +804,9 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
                 <button id="trendBtn" class="active">Trend</button>
             </div>
             <div class="btn-group">
+                <button id="weekendBtn"></button>
+            </div>
+            <div class="btn-group">
                 <a id="exportLink" href="/api/export?period=month" download>Export CSV</a>
                 <button id="pdfBtn">PDF</button>
             </div>
@@ -832,6 +861,8 @@ const LANGS = {
         trendTotal: 'Trend (total)',
         rescanTitle: 'Rescan repository', themeTitle: 'Toggle dark/light mode',
         pdfTitle: 'Print / save as PDF',
+        skipWeekends: 'Skip weekends',
+        skipWeekendsTitle: 'Exclude Saturday and Sunday commits',
         days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
         locale: 'en-US',
     },
@@ -845,6 +876,8 @@ const LANGS = {
         trendTotal: 'Trend (celkem)',
         rescanTitle: 'Znovu naskenovat repozitář', themeTitle: 'Přepnout tmavý/světlý režim',
         pdfTitle: 'Tisk / uložit jako PDF',
+        skipWeekends: 'Bez víkendů',
+        skipWeekendsTitle: 'Vynechat commity ze soboty a neděle',
         days: ['Po', 'Út', 'St', 'Čt', 'Pá', 'So', 'Ne'],
         locale: 'cs-CZ',
     },
@@ -860,6 +893,9 @@ function applyStrings() {
     document.getElementById('rescanBtn').title = L.rescanTitle;
     document.getElementById('themeToggle').title = L.themeTitle;
     document.getElementById('pdfBtn').title = L.pdfTitle;
+    const wb = document.getElementById('weekendBtn');
+    wb.textContent = L.skipWeekends;
+    wb.title = L.skipWeekendsTitle;
     document.querySelectorAll('#periodBtns button, #metricBtns button').forEach(btn => {
         btn.textContent = L[btn.dataset.val];
     });
@@ -880,6 +916,7 @@ applyStrings();
 let currentPeriod = 'month';
 let currentMetric = 'commits';
 let showTrend = true;
+let skipWeekends = false;
 let activeAuthors = new Set();
 // Deactivated authors survive period switches; unknown (new) authors start active
 let inactiveAuthors = new Set();
@@ -949,7 +986,7 @@ function setupControls() {
             document.querySelector('#periodBtns .active').classList.remove('active');
             btn.classList.add('active');
             currentPeriod = btn.dataset.val;
-            document.getElementById('exportLink').href = '/api/export?period=' + currentPeriod;
+            updateExportLink();
             loadData();
         });
     });
@@ -965,6 +1002,12 @@ function setupControls() {
         showTrend = !showTrend;
         document.getElementById('trendBtn').classList.toggle('active', showTrend);
         renderAll();
+    });
+    document.getElementById('weekendBtn').addEventListener('click', () => {
+        skipWeekends = !skipWeekends;
+        document.getElementById('weekendBtn').classList.toggle('active', skipWeekends);
+        updateExportLink();
+        loadData();
     });
     document.getElementById('pdfBtn').addEventListener('click', () => window.print());
     // Print: light theme + charts without animation, restore afterwards
@@ -1013,8 +1056,16 @@ function trendWindowSize(points) {
     return Math.min(21, Math.round(points / 10));
 }
 
+function queryParams() {
+    return 'period=' + currentPeriod + '&weekends=' + (skipWeekends ? '0' : '1');
+}
+
+function updateExportLink() {
+    document.getElementById('exportLink').href = '/api/export?' + queryParams();
+}
+
 async function loadData() {
-    const resp = await fetch('/api/data?period=' + currentPeriod);
+    const resp = await fetch('/api/data?' + queryParams());
     chartData = await resp.json();
     activeAuthors = new Set(
         chartData.authors.map(a => a.name).filter(n => !inactiveAuthors.has(n)));
@@ -1272,7 +1323,8 @@ function renderHeatmap() {
         c.textContent = (h % 3 === 0) ? h : '';
         el.appendChild(c);
     }
-    for (let d = 0; d < 7; d++) {
+    const dayRows = skipWeekends ? 5 : 7;
+    for (let d = 0; d < dayRows; d++) {
         const lbl = document.createElement('div');
         lbl.className = 'hm-label';
         lbl.textContent = days[d];

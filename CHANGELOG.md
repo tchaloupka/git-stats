@@ -13,6 +13,10 @@
 - UI localization by browser locale (Czech, fallback English).
 - Hovering an author in the legend highlights their line in the chart
   (others are dimmed, the trend line too).
+- "Skip weekends" toggle — excludes Saturday/Sunday commits from all views
+  and drops weekend days from the chart axis; the "week" period then covers
+  the last 7 working days. Weekend is judged in UTC for the time series and
+  totals, in the author's local time for the heatmap.
 - PDF export: PDF button opens the browser print dialog with a dedicated
   print layout (light theme forced, controls hidden). Charts print as 3x
   resolution snapshots that follow the page width — works in landscape

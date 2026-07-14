@@ -38,6 +38,7 @@ A browser opens automatically at `http://127.0.0.1:8787` (or the next free port)
 - **4 pie charts** — totals for commits, added/deleted/changed lines for the selected period
 - **Activity heatmap** — commits by weekday × hour of day, in the author's local time
 - **Period filter**: week, month, quarter, year, all
+- **Skip weekends toggle** — excludes Sat/Sun commits everywhere and removes weekend days from the chart axis; "week" then means the last 7 working days
 - **Metric switching**: commits, added lines, deleted lines, total changes
 - **Clickable author legend** — click to toggle visibility, Ctrl+click to solo an author (Ctrl+click again to restore all)
 - **CSV export** — per-bucket, per-author rows for the selected period (Export CSV button or `GET /api/export?period=...`)
