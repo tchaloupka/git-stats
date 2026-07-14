@@ -824,6 +824,8 @@ let currentPeriod = 'month';
 let currentMetric = 'commits';
 let showTrend = true;
 let activeAuthors = new Set();
+// Deactivated authors survive period switches; unknown (new) authors start active
+let inactiveAuthors = new Set();
 let chartData = null;
 let timeChart = null;
 let pieCharts = {};
@@ -928,7 +930,8 @@ function trendWindowSize(points) {
 async function loadData() {
     const resp = await fetch('/api/data?period=' + currentPeriod);
     chartData = await resp.json();
-    activeAuthors = new Set(chartData.authors.map(a => a.name));
+    activeAuthors = new Set(
+        chartData.authors.map(a => a.name).filter(n => !inactiveAuthors.has(n)));
     const empty = !chartData.authors.length;
     document.getElementById('emptyMsg').style.display = empty ? 'block' : 'none';
     document.getElementById('dataView').style.display = empty ? 'none' : 'block';
@@ -941,7 +944,8 @@ function buildLegend() {
     el.innerHTML = '';
     chartData.authors.forEach(author => {
         const item = document.createElement('div');
-        item.className = 'legend-item active';
+        item.className = 'legend-item ' +
+            (activeAuthors.has(author.name) ? 'active' : 'inactive');
         item.style.color = author.color;
         item.dataset.name = author.name;
         const dot = document.createElement('span');
@@ -955,15 +959,20 @@ function buildLegend() {
                 const soloActive = activeAuthors.size === 1 && activeAuthors.has(author.name);
                 if (soloActive) {
                     activeAuthors = new Set(chartData.authors.map(a => a.name));
+                    inactiveAuthors.clear();
                 } else {
                     activeAuthors = new Set([author.name]);
+                    inactiveAuthors = new Set(
+                        chartData.authors.map(a => a.name).filter(n => n !== author.name));
                 }
                 updateLegendStyles();
             } else {
                 if (activeAuthors.has(author.name)) {
                     activeAuthors.delete(author.name);
+                    inactiveAuthors.add(author.name);
                 } else {
                     activeAuthors.add(author.name);
+                    inactiveAuthors.delete(author.name);
                 }
                 item.classList.toggle('active', activeAuthors.has(author.name));
                 item.classList.toggle('inactive', !activeAuthors.has(author.name));

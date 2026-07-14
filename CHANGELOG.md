@@ -33,6 +33,8 @@
 - Aggregation moved from Python to SQL (`GROUP BY` in SQLite).
 
 ### Fixed
+- Switching the period filter no longer resets the author filter — deactivated
+  authors stay deactivated; authors newly appearing in the period start active.
 - Commits removed by rebase/force-push are pruned from the cache instead of
   inflating stats forever.
 - Commits with an empty author e-mail were dropped during parsing (63 of
