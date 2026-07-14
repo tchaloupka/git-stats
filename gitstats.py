@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
 """Git Stats - Interactive git repository statistics viewer.
 
-Run this script from any git repository to visualize commit statistics
-in a web browser. Data is cached in .gitstats/cache.db for fast access.
+Point this script at any git repository to visualize commit statistics
+in a web browser. Data is cached in ~/.cache/gitstats/ for fast access.
 
 Usage:
-    python gitstats.py              # Start server and open browser
-    python gitstats.py -p 9000      # Use custom port
-    python gitstats.py --rescan     # Force full rescan
-    python gitstats.py -n           # Don't auto-open browser
+    python gitstats.py                  # Stats for repo in current directory
+    python gitstats.py /path/to/repo    # Stats for another repo
+    python gitstats.py -p 9000          # Use custom port
+    python gitstats.py -b main          # Only commits reachable from main
+    python gitstats.py --pathspec src/  # Only commits touching src/
+    python gitstats.py --rescan         # Force full rescan
+    python gitstats.py -n               # Don't auto-open browser
 """
 
 import argparse
+import csv
+import hashlib
+import io
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.request
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 from socketserver import ThreadingTCPServer
 from urllib.parse import urlparse, parse_qs
 
 # --- Constants ---
 
-DB_DIR = '.gitstats'
-DB_FILE = os.path.join(DB_DIR, 'cache.db')
+SCHEMA_VERSION = '2'
+CHARTJS_URL = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.js'
 
 COLORS = [
     '#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f',
@@ -36,7 +43,16 @@ COLORS = [
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
 ]
 
-scan_status = {'scanning': False, 'total': 0, 'done': False}
+# Filled in by main(): repo_root, db_path, branch, pathspec
+CONFIG = {}
+
+scan_status = {'scanning': False, 'total': 0, 'processed': 0, 'done': False}
+scan_lock = threading.Lock()
+
+
+def cache_dir():
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'gitstats')
 
 
 # --- Database ---
@@ -45,180 +61,208 @@ def init_db(db_path):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row and row[0] != SCHEMA_VERSION:
+        conn.execute('DROP TABLE IF EXISTS commits')
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
     conn.execute('''CREATE TABLE IF NOT EXISTS commits (
         hash TEXT PRIMARY KEY,
         author TEXT NOT NULL,
-        date TEXT NOT NULL,
+        email TEXT NOT NULL,
+        date_utc TEXT NOT NULL,
+        tz_offset_min INTEGER NOT NULL DEFAULT 0,
         additions INTEGER DEFAULT 0,
         deletions INTEGER DEFAULT 0
     )''')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON commits(date)')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_author ON commits(author)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON commits(date_utc)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_email ON commits(email)')
     conn.commit()
     conn.close()
 
 
 # --- Git Parsing ---
 
-def get_repo_name():
+def git_cmd(*args):
+    return ['git', '-C', CONFIG['repo_root']] + list(args)
+
+
+def parse_iso_date(s):
+    """Parse ISO date with offset -> (utc naive 'YYYY-MM-DD HH:MM:SS', offset minutes)."""
+    dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    offset = dt.utcoffset() or timedelta(0)
+    utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return utc.strftime('%Y-%m-%d %H:%M:%S'), int(offset.total_seconds() // 60)
+
+
+def rev_scope():
+    """Rev-list scope: single ref or all refs."""
+    return [CONFIG['branch']] if CONFIG.get('branch') else ['--all']
+
+
+def pathspec_args():
+    ps = CONFIG.get('pathspec')
+    return ['--'] + ps if ps else []
+
+
+def flush_block(lines, known, batch):
+    """Parse one commit block (hash, name, email, date, numstat lines) into batch."""
+    if len(lines) < 4:
+        return
+    commit_hash = lines[0].strip()
+    if not commit_hash or commit_hash in known:
+        return
+    author = lines[1].strip()
+    # Empty email would merge unrelated authors into one group
+    email = lines[2].strip().lower() or author
+    date_str = lines[3].strip()
     try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--show-toplevel'],
-            capture_output=True, text=True, check=True
-        )
-        return os.path.basename(result.stdout.strip())
-    except subprocess.CalledProcessError:
-        return 'Unknown'
+        date_utc, tz_min = parse_iso_date(date_str)
+    except ValueError:
+        return
+
+    additions = 0
+    deletions = 0
+    for line in lines[4:]:
+        parts = line.split('\t')
+        if len(parts) >= 2:
+            try:
+                additions += int(parts[0]) if parts[0] != '-' else 0
+                deletions += int(parts[1]) if parts[1] != '-' else 0
+            except ValueError:
+                pass
+    batch.append((commit_hash, author, email, date_utc, tz_min, additions, deletions))
 
 
-def scan_repository(db_path):
+def scan_repository(db_path, full=False):
     global scan_status
-    scan_status = {'scanning': True, 'total': 0, 'done': False}
+    with scan_lock:
+        if scan_status['scanning']:
+            return
+        scan_status = {'scanning': True, 'total': 0, 'processed': 0, 'done': False}
 
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA journal_mode=WAL')
 
-    # Get known hashes
+    if full:
+        conn.execute('DELETE FROM commits')
+        conn.commit()
+
     known = set(r[0] for r in conn.execute('SELECT hash FROM commits'))
     if known:
         print(f"  Cache: {len(known)} commits, scanning for new...")
 
-    # Quick check: get all commit hashes (fast, no diff stats)
+    # Fast pre-check: all reachable hashes, no diff stats
     try:
         rev_result = subprocess.run(
-            ['git', 'rev-list', '--all'],
-            capture_output=True, text=True, check=True, timeout=60
+            git_cmd('rev-list', *rev_scope(), *pathspec_args()),
+            capture_output=True, text=True, check=True, timeout=120
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"Error running git rev-list: {e}", file=sys.stderr)
-        scan_status = {'scanning': False, 'total': 0, 'done': True}
+        scan_status = {'scanning': False, 'total': 0, 'processed': 0, 'done': True}
         conn.close()
         return
 
-    all_hashes = set(rev_result.stdout.strip().split('\n')) if rev_result.stdout.strip() else set()
+    all_hashes = set(rev_result.stdout.split())
+
+    # Prune commits that disappeared (rebase, force-push, deleted branches)
+    stale = known - all_hashes
+    if stale:
+        conn.executemany('DELETE FROM commits WHERE hash = ?', [(h,) for h in stale])
+        conn.commit()
+        known -= stale
+        print(f"  Pruned {len(stale)} stale commits.")
+
     new_hashes = all_hashes - known
-
     if not new_hashes:
-        scan_status = {'scanning': False, 'total': 0, 'done': True}
-        print(f"  No new commits.")
+        scan_status = {'scanning': False, 'total': 0, 'processed': 0, 'done': True}
+        print("  No new commits.")
         conn.close()
         return
 
+    scan_status['total'] = len(new_hashes)
     print(f"  {len(new_hashes)} new commits to process...")
 
-    # Full log with numstat only when there are new commits
-    try:
-        result = subprocess.run(
-            ['git', 'log', '--all', '--format=COMMIT_SEP%n%H%n%aN%n%aI', '--numstat'],
-            capture_output=True, text=True, check=True, timeout=300
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print(f"Error running git log: {e}", file=sys.stderr)
-        scan_status = {'scanning': False, 'total': 0, 'done': True}
-        conn.close()
-        return
+    # Fetch numstat only for the new commits, streamed to keep memory flat
+    proc = subprocess.Popen(
+        git_cmd('log', '--no-walk=unsorted', '--stdin',
+                '--format=COMMIT_SEP%n%H%n%aN%n%aE%n%aI', '--numstat',
+                *pathspec_args()),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
 
-    blocks = result.stdout.split('COMMIT_SEP\n')
+    def feed():
+        try:
+            proc.stdin.write('\n'.join(new_hashes))
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+
+    threading.Thread(target=feed, daemon=True).start()
+
     new_count = 0
     batch = []
+    block = []
 
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-
-        lines = block.split('\n')
-        if len(lines) < 3:
-            continue
-
-        commit_hash = lines[0].strip()
-        if commit_hash in known:
-            continue
-
-        author = lines[1].strip()
-        date_str = lines[2].strip()
-
-        additions = 0
-        deletions = 0
-        for line in lines[3:]:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                try:
-                    additions += int(parts[0]) if parts[0] != '-' else 0
-                    deletions += int(parts[1]) if parts[1] != '-' else 0
-                except ValueError:
-                    pass
-
-        batch.append((commit_hash, author, date_str, additions, deletions))
-        new_count += 1
-        scan_status['total'] = new_count
-
-        if len(batch) >= 500:
-            conn.executemany(
-                'INSERT OR IGNORE INTO commits VALUES (?, ?, ?, ?, ?)', batch
-            )
-            conn.commit()
-            batch = []
-
-    if batch:
-        conn.executemany(
-            'INSERT OR IGNORE INTO commits VALUES (?, ?, ?, ?, ?)', batch
-        )
+    def commit_batch():
+        nonlocal batch
+        conn.executemany('INSERT OR IGNORE INTO commits VALUES (?, ?, ?, ?, ?, ?, ?)', batch)
         conn.commit()
+        batch = []
+
+    for line in proc.stdout:
+        line = line.rstrip('\n')
+        if line == 'COMMIT_SEP':
+            if block:
+                before = len(batch)
+                flush_block(block, known, batch)
+                new_count += len(batch) - before
+                scan_status['processed'] = new_count
+                block = []
+                if len(batch) >= 500:
+                    commit_batch()
+        else:
+            # Keep empty lines: author email (%aE) can be empty and
+            # positions in the block are fixed
+            block.append(line)
+    if block:
+        before = len(batch)
+        flush_block(block, known, batch)
+        new_count += len(batch) - before
+
+    proc.wait()
+    commit_batch()
+    if proc.returncode != 0:
+        print(f"Error: git log exited with code {proc.returncode}", file=sys.stderr)
 
     conn.close()
-    scan_status = {'scanning': False, 'total': new_count, 'done': True}
+    scan_status = {'scanning': False, 'total': new_count, 'processed': new_count, 'done': True}
     print(f"  Scan complete: {new_count} new commits.")
 
 
 # --- Data Aggregation ---
 
-def parse_date(s):
-    """Parse ISO date string, return naive (local) datetime."""
-    s = s.replace('Z', '+00:00')
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        dt = datetime.fromisoformat(s[:19])
-    # Strip timezone to keep everything as naive datetimes
-    return dt.replace(tzinfo=None)
-
-
 def get_period_start(period):
-    now = datetime.now()
-    if period == 'week':
-        return now - timedelta(days=7)
-    elif period == 'month':
-        return now - timedelta(days=30)
-    elif period == 'quarter':
-        return now - timedelta(days=90)
-    elif period == 'year':
-        return now - timedelta(days=365)
-    return None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    days = {'week': 7, 'month': 30, 'quarter': 90, 'year': 365}.get(period)
+    return now - timedelta(days=days) if days else None
 
 
 def bucket_format(period):
-    if period in ('week', 'month'):
-        return 'day'
-    elif period == 'quarter':
+    if period in ('week', 'month', 'quarter'):
         return 'day'
     elif period == 'year':
         return 'week'
     return 'month'
 
 
-def date_to_bucket(dt, fmt):
-    if fmt == 'day':
-        return dt.strftime('%Y-%m-%d')
-    elif fmt == 'week':
-        d = dt.date() if isinstance(dt, datetime) else dt
-        d -= timedelta(days=d.weekday())
-        return d.isoformat()
-    else:
-        return dt.strftime('%Y-%m')
+BUCKET_SQL = {
+    'day': "date(date_utc)",
+    'week': "date(date_utc, '-6 days', 'weekday 1')",
+    'month': "strftime('%Y-%m', date_utc)",
+}
 
 
 def generate_labels(start_date, end_date, fmt):
@@ -247,95 +291,155 @@ def generate_labels(start_date, end_date, fmt):
     return labels
 
 
+def display_names(conn, where, params):
+    """Map email -> display name (most frequent author name for that email)."""
+    rows = conn.execute(
+        f'SELECT email, author, COUNT(*) FROM commits {where} GROUP BY email, author',
+        params
+    ).fetchall()
+    best = {}
+    for email, author, cnt in rows:
+        if email not in best or cnt > best[email][1]:
+            best[email] = (author, cnt)
+    names = {}
+    used = {}
+    for email, (author, _) in sorted(best.items()):
+        if author in used:
+            names[email] = f'{author} ({email})'
+            # retroactively disambiguate the first holder too
+            first_email = used[author]
+            names[first_email] = f'{author} ({first_email})'
+        else:
+            used[author] = email
+            names[email] = author
+    return names
+
+
 def get_data(db_path, period='month'):
     conn = sqlite3.connect(db_path)
-    conn.execute('PRAGMA journal_mode=WAL')
     start = get_period_start(period)
     fmt = bucket_format(period)
+    bucket = BUCKET_SQL[fmt]
 
+    where = ''
+    params = ()
     if start:
-        rows = conn.execute(
-            'SELECT author, date, additions, deletions FROM commits WHERE date >= ? ORDER BY date',
-            (start.isoformat(),)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            'SELECT author, date, additions, deletions FROM commits ORDER BY date'
-        ).fetchall()
-    conn.close()
+        where = 'WHERE date_utc >= ?'
+        params = (start.strftime('%Y-%m-%d %H:%M:%S'),)
 
-    if not rows:
-        return {'authors': [], 'timeseries': {'labels': [], 'data': {}}, 'totals': {}}
+    minmax = conn.execute(f'SELECT MIN(date_utc), MAX(date_utc) FROM commits {where}', params).fetchone()
+    if not minmax or not minmax[0]:
+        conn.close()
+        return {'authors': [], 'timeseries': {'labels': [], 'data': {}},
+                'totals': {}, 'heatmap': {}}
 
-    # Parse dates and find range
-    parsed = []
-    dates = []
-    for author, date_str, adds, dels in rows:
-        dt = parse_date(date_str)
-        parsed.append((author, dt, adds, dels))
-        dates.append(dt)
-
-    min_date = min(dates)
-    max_date = max(dates)
+    min_date = datetime.strptime(minmax[0], '%Y-%m-%d %H:%M:%S')
+    max_date = datetime.strptime(minmax[1], '%Y-%m-%d %H:%M:%S')
     if start and start > min_date:
         min_date = start
-
     labels = generate_labels(min_date, max_date, fmt)
-    label_set = set(labels)
+    label_idx = {lbl: i for i, lbl in enumerate(labels)}
 
-    # Aggregate
-    agg = {}
+    names = display_names(conn, where, params)
+
+    # Totals per author (grouped by email)
     totals = {}
+    for email, c, a, d in conn.execute(
+        f'SELECT email, COUNT(*), SUM(additions), SUM(deletions) FROM commits {where} GROUP BY email',
+        params
+    ):
+        totals[names[email]] = {'commits': c, 'additions': a, 'deletions': d, 'changes': a + d}
 
-    for author, dt, adds, dels in parsed:
-        bucket = date_to_bucket(dt, fmt)
-        if bucket not in label_set:
+    sorted_authors = sorted(totals.keys(), key=lambda n: totals[n]['commits'], reverse=True)
+
+    # Timeseries: aggregated in SQL, gaps filled in Python
+    ts_data = {
+        n: {'commits': [0] * len(labels), 'additions': [0] * len(labels),
+            'deletions': [0] * len(labels), 'changes': [0] * len(labels)}
+        for n in sorted_authors
+    }
+    for email, b, c, a, d in conn.execute(
+        f'SELECT email, {bucket} AS b, COUNT(*), SUM(additions), SUM(deletions) '
+        f'FROM commits {where} GROUP BY email, b',
+        params
+    ):
+        i = label_idx.get(b)
+        if i is None:
             continue
+        t = ts_data[names[email]]
+        t['commits'][i] += c
+        t['additions'][i] += a
+        t['deletions'][i] += d
+        t['changes'][i] += a + d
 
-        if author not in agg:
-            agg[author] = {}
-        b = agg[author].setdefault(bucket, {'c': 0, 'a': 0, 'd': 0})
-        b['c'] += 1
-        b['a'] += adds
-        b['d'] += dels
+    # Heatmap (commits by author-local weekday x hour); %w: 0=Sun -> row 0=Mon
+    heatmap = {n: [[0] * 24 for _ in range(7)] for n in sorted_authors}
+    for email, dow, hour, c in conn.execute(
+        f"SELECT email, CAST(strftime('%w', datetime(date_utc, tz_offset_min || ' minutes')) AS INTEGER), "
+        f"CAST(strftime('%H', datetime(date_utc, tz_offset_min || ' minutes')) AS INTEGER), COUNT(*) "
+        f'FROM commits {where} GROUP BY 1, 2, 3',
+        params
+    ):
+        heatmap[names[email]][(dow + 6) % 7][hour] += c
 
-        t = totals.setdefault(author, {'commits': 0, 'additions': 0, 'deletions': 0, 'changes': 0})
-        t['commits'] += 1
-        t['additions'] += adds
-        t['deletions'] += dels
-        t['changes'] += adds + dels
-
-    # Sort authors by total commits
-    sorted_authors = sorted(totals.keys(), key=lambda a: totals[a]['commits'], reverse=True)
-
-    # Build timeseries
-    ts_data = {}
-    for author in sorted_authors:
-        commits, additions, deletions, changes = [], [], [], []
-        for label in labels:
-            d = agg.get(author, {}).get(label, {'c': 0, 'a': 0, 'd': 0})
-            commits.append(d['c'])
-            additions.append(d['a'])
-            deletions.append(d['d'])
-            changes.append(d['a'] + d['d'])
-        ts_data[author] = {
-            'commits': commits, 'additions': additions,
-            'deletions': deletions, 'changes': changes
-        }
+    conn.close()
 
     authors = [{'name': n, 'color': COLORS[i % len(COLORS)]} for i, n in enumerate(sorted_authors)]
-
     return {
         'authors': authors,
         'timeseries': {'labels': labels, 'data': ts_data},
-        'totals': totals
+        'totals': totals,
+        'heatmap': heatmap,
     }
+
+
+def export_csv(db_path, period='month'):
+    data = get_data(db_path, period)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['bucket', 'author', 'commits', 'additions', 'deletions', 'changes'])
+    labels = data['timeseries']['labels']
+    for author in data['authors']:
+        series = data['timeseries']['data'][author['name']]
+        for i, label in enumerate(labels):
+            if series['commits'][i] or series['changes'][i]:
+                w.writerow([label, author['name'], series['commits'][i],
+                            series['additions'][i], series['deletions'][i], series['changes'][i]])
+    return buf.getvalue().encode('utf-8')
+
+
+# --- Chart.js (local vendored file / cached download / CDN fallback) ---
+
+def get_chartjs():
+    if 'chartjs' in CONFIG:
+        return CONFIG['chartjs']
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, 'chart.umd.js'),
+        os.path.join(cache_dir(), 'chart.umd.js'),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                CONFIG['chartjs'] = f.read()
+                return CONFIG['chartjs']
+    try:
+        with urllib.request.urlopen(CHARTJS_URL, timeout=15) as resp:
+            data = resp.read()
+        os.makedirs(cache_dir(), exist_ok=True)
+        with open(candidates[1], 'wb') as f:
+            f.write(data)
+        CONFIG['chartjs'] = data
+        return data
+    except OSError:
+        CONFIG['chartjs'] = None
+        return None
 
 
 # --- HTTP Server ---
 
 class StatsHandler(BaseHTTPRequestHandler):
-    db_path = DB_FILE
+    db_path = None
     repo_name = ''
 
     def log_message(self, format, *args):
@@ -345,17 +449,43 @@ class StatsHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        period = params.get('period', ['month'])[0]
+        if period not in ('week', 'month', 'quarter', 'year', 'all'):
+            period = 'month'
 
         if path == '/':
             self._respond(200, 'text/html; charset=utf-8', HTML_PAGE.encode())
+        elif path == '/chart.js':
+            js = get_chartjs()
+            if js:
+                self._respond(200, 'application/javascript', js)
+            else:
+                self._respond(404, 'text/plain', b'Chart.js unavailable')
         elif path == '/api/status':
-            data = {**scan_status, 'repo': self.repo_name}
-            self._json(data)
+            self._json({**scan_status, 'repo': self.repo_name})
         elif path == '/api/data':
-            period = params.get('period', ['month'])[0]
-            if period not in ('week', 'month', 'quarter', 'year', 'all'):
-                period = 'month'
             self._json(get_data(self.db_path, period))
+        elif path == '/api/export':
+            body = export_csv(self.db_path, period)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/csv; charset=utf-8')
+            self.send_header('Content-Disposition',
+                             f'attachment; filename="gitstats-{self.repo_name}-{period}.csv"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._respond(404, 'text/plain', b'Not found')
+
+    def do_POST(self):
+        if urlparse(self.path).path == '/api/rescan':
+            if scan_status['scanning']:
+                self._json({'started': False, 'reason': 'already scanning'})
+                return
+            threading.Thread(
+                target=scan_repository, args=(self.db_path,), kwargs={'full': True}, daemon=True
+            ).start()
+            self._json({'started': True})
         else:
             self._respond(404, 'text/plain', b'Not found')
 
@@ -367,19 +497,23 @@ class StatsHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, data):
-        body = json.dumps(data).encode()
-        self._respond(200, 'application/json', body)
+        self._respond(200, 'application/json', json.dumps(data).encode())
 
 
 # --- HTML Page ---
 
 HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Git Stats</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="/chart.js"></script>
+<script>
+if (typeof Chart === 'undefined') {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js@4"><\/script>');
+}
+</script>
 <style>
 :root {
     --bg: #f0f2f5;
@@ -433,7 +567,7 @@ header {
 header h1 { font-size: 1.4rem; font-weight: 600; }
 .header-right { display: flex; align-items: center; gap: 1rem; }
 .repo-name { opacity: 0.7; font-size: 0.9rem; }
-.theme-toggle {
+.header-btn {
     background: none;
     border: 1px solid rgba(255,255,255,0.25);
     color: white;
@@ -444,7 +578,7 @@ header h1 { font-size: 1.4rem; font-weight: 600; }
     transition: border-color 0.2s;
     line-height: 1;
 }
-.theme-toggle:hover { border-color: rgba(255,255,255,0.5); }
+.header-btn:hover { border-color: rgba(255,255,255,0.5); }
 main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
 .controls {
     display: flex;
@@ -459,7 +593,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     overflow: hidden;
     box-shadow: 0 1px 3px var(--shadow);
 }
-.btn-group button {
+.btn-group button, .btn-group a {
     padding: 0.5rem 1rem;
     border: none;
     background: var(--btn-bg);
@@ -468,9 +602,10 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     color: var(--btn-text);
     transition: all 0.2s;
     border-right: 1px solid var(--btn-border);
+    text-decoration: none;
 }
-.btn-group button:last-child { border-right: none; }
-.btn-group button:hover { background: var(--btn-hover); }
+.btn-group button:last-child, .btn-group a:last-child { border-right: none; }
+.btn-group button:hover, .btn-group a:hover { background: var(--btn-hover); }
 .btn-group button.active { background: #4e79a7; color: white; }
 .card {
     background: var(--card-bg);
@@ -479,6 +614,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     box-shadow: 0 1px 3px var(--shadow);
     margin-bottom: 1.5rem;
 }
+.card h3 { font-size: 0.95rem; color: var(--subtitle); margin-bottom: 1rem; }
 .chart-container { position: relative; height: 400px; }
 .legend {
     display: flex;
@@ -510,6 +646,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: 1.5rem;
+    margin-bottom: 1.5rem;
 }
 .pie-card {
     background: var(--card-bg);
@@ -521,6 +658,21 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
 .pie-card h3 { font-size: 0.95rem; color: var(--subtitle); margin-bottom: 0.5rem; }
 .pie-card .total { font-size: 1.4rem; font-weight: 700; color: var(--total-color); margin-bottom: 1rem; }
 .pie-container { position: relative; max-width: 220px; margin: 0 auto; }
+.heatmap {
+    display: grid;
+    grid-template-columns: 2.2rem repeat(24, 1fr);
+    gap: 2px;
+    font-size: 0.7rem;
+    color: var(--subtitle);
+}
+.heatmap .hm-cell {
+    aspect-ratio: 1;
+    border-radius: 3px;
+    background: var(--grid-color);
+    min-width: 8px;
+}
+.heatmap .hm-label { display: flex; align-items: center; }
+.heatmap .hm-hour { text-align: center; }
 .loading {
     text-align: center;
     padding: 4rem;
@@ -545,64 +697,121 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
     <h1>Git Stats</h1>
     <div class="header-right">
         <span class="repo-name" id="repoName"></span>
-        <button class="theme-toggle" id="themeToggle" title="Přepnout tmavý/světlý režim">&#9790;</button>
+        <button class="header-btn" id="rescanBtn">&#8635;</button>
+        <button class="header-btn" id="themeToggle">&#9790;</button>
     </div>
 </header>
 <main>
     <div id="loadingView" class="loading">
         <div class="spinner"></div>
-        <div class="scan-info" id="scanInfo">Skenování repozitáře...</div>
+        <div class="scan-info" id="scanInfo"></div>
     </div>
     <div id="mainView" style="display:none">
         <div class="controls">
             <div class="btn-group" id="periodBtns">
-                <button data-val="week">Týden</button>
-                <button data-val="month" class="active">Měsíc</button>
-                <button data-val="quarter">Kvartál</button>
-                <button data-val="year">Rok</button>
-                <button data-val="all">Vše</button>
+                <button data-val="week"></button>
+                <button data-val="month" class="active"></button>
+                <button data-val="quarter"></button>
+                <button data-val="year"></button>
+                <button data-val="all"></button>
             </div>
             <div class="btn-group" id="metricBtns">
-                <button data-val="commits" class="active">Commity</button>
-                <button data-val="additions">Přidané řádky</button>
-                <button data-val="deletions">Smazané řádky</button>
-                <button data-val="changes">Změny celkem</button>
+                <button data-val="commits" class="active"></button>
+                <button data-val="additions"></button>
+                <button data-val="deletions"></button>
+                <button data-val="changes"></button>
             </div>
             <div class="btn-group">
                 <button id="trendBtn" class="active">Trend</button>
             </div>
-        </div>
-        <div class="card">
-            <div class="legend" id="legend"></div>
-            <div class="chart-container">
-                <canvas id="timeChart"></canvas>
+            <div class="btn-group">
+                <a id="exportLink" href="/api/export?period=month" download>Export CSV</a>
             </div>
         </div>
-        <div class="pie-grid" id="pieGrid">
-            <div class="pie-card">
-                <h3>Commity</h3>
-                <div class="total" id="totalCommits">0</div>
-                <div class="pie-container"><canvas id="pieCommits"></canvas></div>
+        <div id="emptyMsg" class="card empty-msg" style="display:none"></div>
+        <div id="dataView">
+            <div class="card">
+                <div class="legend" id="legend"></div>
+                <div class="chart-container">
+                    <canvas id="timeChart"></canvas>
+                </div>
             </div>
-            <div class="pie-card">
-                <h3>Přidané řádky</h3>
-                <div class="total" id="totalAdditions">0</div>
-                <div class="pie-container"><canvas id="pieAdditions"></canvas></div>
+            <div class="pie-grid" id="pieGrid">
+                <div class="pie-card">
+                    <h3 data-metric="commits"></h3>
+                    <div class="total" id="totalCommits">0</div>
+                    <div class="pie-container"><canvas id="pieCommits"></canvas></div>
+                </div>
+                <div class="pie-card">
+                    <h3 data-metric="additions"></h3>
+                    <div class="total" id="totalAdditions">0</div>
+                    <div class="pie-container"><canvas id="pieAdditions"></canvas></div>
+                </div>
+                <div class="pie-card">
+                    <h3 data-metric="deletions"></h3>
+                    <div class="total" id="totalDeletions">0</div>
+                    <div class="pie-container"><canvas id="pieDeletions"></canvas></div>
+                </div>
+                <div class="pie-card">
+                    <h3 data-metric="changes"></h3>
+                    <div class="total" id="totalChanges">0</div>
+                    <div class="pie-container"><canvas id="pieChanges"></canvas></div>
+                </div>
             </div>
-            <div class="pie-card">
-                <h3>Smazané řádky</h3>
-                <div class="total" id="totalDeletions">0</div>
-                <div class="pie-container"><canvas id="pieDeletions"></canvas></div>
-            </div>
-            <div class="pie-card">
-                <h3>Změny celkem</h3>
-                <div class="total" id="totalChanges">0</div>
-                <div class="pie-container"><canvas id="pieChanges"></canvas></div>
+            <div class="card">
+                <h3 id="heatmapTitle"></h3>
+                <div class="heatmap" id="heatmap"></div>
             </div>
         </div>
     </div>
 </main>
 <script>
+// --- i18n: pick language from browser locale, fall back to English ---
+const LANGS = {
+    en: {
+        week: 'Week', month: 'Month', quarter: 'Quarter', year: 'Year', all: 'All',
+        commits: 'Commits', additions: 'Added lines', deletions: 'Deleted lines',
+        changes: 'Total changes',
+        scanning: 'Scanning repository...', commitsWord: 'commits',
+        empty: 'No commits in the selected period.',
+        heatmapTitle: 'Activity by day and hour (commits, author local time)',
+        trendTotal: 'Trend (total)',
+        rescanTitle: 'Rescan repository', themeTitle: 'Toggle dark/light mode',
+        days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+        locale: 'en-US',
+    },
+    cs: {
+        week: 'Týden', month: 'Měsíc', quarter: 'Kvartál', year: 'Rok', all: 'Vše',
+        commits: 'Commity', additions: 'Přidané řádky', deletions: 'Smazané řádky',
+        changes: 'Změny celkem',
+        scanning: 'Skenování repozitáře...', commitsWord: 'commitů',
+        empty: 'Žádné commity ve zvoleném období.',
+        heatmapTitle: 'Aktivita podle dne a hodiny (commity, lokální čas autora)',
+        trendTotal: 'Trend (celkem)',
+        rescanTitle: 'Znovu naskenovat repozitář', themeTitle: 'Přepnout tmavý/světlý režim',
+        days: ['Po', 'Út', 'St', 'Čt', 'Pá', 'So', 'Ne'],
+        locale: 'cs-CZ',
+    },
+};
+const LANG_CODE = (navigator.language || 'en').slice(0, 2).toLowerCase();
+const L = LANGS[LANG_CODE] || LANGS.en;
+
+function applyStrings() {
+    document.documentElement.lang = LANGS[LANG_CODE] ? LANG_CODE : 'en';
+    document.getElementById('scanInfo').textContent = L.scanning;
+    document.getElementById('emptyMsg').textContent = L.empty;
+    document.getElementById('heatmapTitle').textContent = L.heatmapTitle;
+    document.getElementById('rescanBtn').title = L.rescanTitle;
+    document.getElementById('themeToggle').title = L.themeTitle;
+    document.querySelectorAll('#periodBtns button, #metricBtns button').forEach(btn => {
+        btn.textContent = L[btn.dataset.val];
+    });
+    document.querySelectorAll('[data-metric]').forEach(el => {
+        el.textContent = L[el.dataset.metric];
+    });
+}
+applyStrings();
+
 // Dark mode
 (function() {
     const saved = localStorage.getItem('gitstats-theme');
@@ -633,8 +842,12 @@ async function waitForScan() {
         const s = await resp.json();
         document.getElementById('repoName').textContent = s.repo;
         if (s.done) break;
-        document.getElementById('scanInfo').textContent =
-            'Skenování repozitáře... ' + s.total + ' commitů';
+        let msg = L.scanning;
+        if (s.total > 0) {
+            const pct = Math.round(100 * s.processed / s.total);
+            msg += ' ' + s.processed + ' / ' + s.total + ' ' + L.commitsWord + ' (' + pct + ' %)';
+        }
+        document.getElementById('scanInfo').textContent = msg;
         await new Promise(r => setTimeout(r, 500));
     }
 }
@@ -659,13 +872,22 @@ function setupControls() {
         document.getElementById('themeToggle').innerHTML = dark ? '&#9788;' : '&#9790;';
         renderAll();
     });
-    // Set initial icon
     document.getElementById('themeToggle').innerHTML = isDark() ? '&#9788;' : '&#9790;';
+    document.getElementById('rescanBtn').addEventListener('click', async () => {
+        await fetch('/api/rescan', {method: 'POST'});
+        document.getElementById('mainView').style.display = 'none';
+        document.getElementById('loadingView').style.display = 'block';
+        await waitForScan();
+        document.getElementById('loadingView').style.display = 'none';
+        document.getElementById('mainView').style.display = 'block';
+        await loadData();
+    });
     document.querySelectorAll('#periodBtns button').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelector('#periodBtns .active').classList.remove('active');
             btn.classList.add('active');
             currentPeriod = btn.dataset.val;
+            document.getElementById('exportLink').href = '/api/export?period=' + currentPeriod;
             loadData();
         });
     });
@@ -707,6 +929,9 @@ async function loadData() {
     const resp = await fetch('/api/data?period=' + currentPeriod);
     chartData = await resp.json();
     activeAuthors = new Set(chartData.authors.map(a => a.name));
+    const empty = !chartData.authors.length;
+    document.getElementById('emptyMsg').style.display = empty ? 'block' : 'none';
+    document.getElementById('dataView').style.display = empty ? 'none' : 'block';
     buildLegend();
     renderAll();
 }
@@ -718,8 +943,12 @@ function buildLegend() {
         const item = document.createElement('div');
         item.className = 'legend-item active';
         item.style.color = author.color;
-        item.innerHTML = '<span class="legend-dot" style="background:' +
-            author.color + '"></span>' + author.name;
+        item.dataset.name = author.name;
+        const dot = document.createElement('span');
+        dot.className = 'legend-dot';
+        dot.style.background = author.color;
+        item.appendChild(dot);
+        item.appendChild(document.createTextNode(author.name));
         item.addEventListener('click', (e) => {
             if (e.ctrlKey || e.metaKey) {
                 // Solo mode: select only this author (or restore all if already solo)
@@ -747,25 +976,22 @@ function buildLegend() {
 
 function updateLegendStyles() {
     document.querySelectorAll('.legend-item').forEach(item => {
-        const name = item.textContent;
+        const name = item.dataset.name;
         item.classList.toggle('active', activeAuthors.has(name));
         item.classList.toggle('inactive', !activeAuthors.has(name));
     });
 }
 
 function renderAll() {
+    if (!chartData || !chartData.authors.length) return;
     renderTimeChart();
     renderPieCharts();
+    renderHeatmap();
 }
 
 function renderTimeChart() {
     const ctx = document.getElementById('timeChart');
     if (timeChart) timeChart.destroy();
-
-    if (!chartData || !chartData.authors.length) {
-        timeChart = null;
-        return;
-    }
 
     const labels = chartData.timeseries.labels;
     const many = labels.length > 60;
@@ -791,7 +1017,7 @@ function renderTimeChart() {
         const trendData = movingAverage(totals, win);
         const trendColor = isDark() ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.4)';
         datasets.push({
-            label: 'Trend (celkem)',
+            label: L.trendTotal,
             data: trendData,
             borderColor: trendColor,
             backgroundColor: 'transparent',
@@ -817,7 +1043,7 @@ function renderTimeChart() {
                 tooltip: {
                     callbacks: {
                         label: item => item.dataset.label + ': ' +
-                            item.parsed.y.toLocaleString('cs-CZ')
+                            item.parsed.y.toLocaleString(L.locale)
                     }
                 }
             },
@@ -831,7 +1057,7 @@ function renderTimeChart() {
                     grid: { color: cc.gridColor },
                     ticks: {
                         color: cc.tickColor,
-                        callback: v => v.toLocaleString('cs-CZ')
+                        callback: v => v.toLocaleString(L.locale)
                     }
                 }
             }
@@ -855,7 +1081,7 @@ function renderPieCharts() {
             return t ? t[metric] : 0;
         });
         const total = values.reduce((s, v) => s + v, 0);
-        document.getElementById(totalIds[i]).textContent = total.toLocaleString('cs-CZ');
+        document.getElementById(totalIds[i]).textContent = total.toLocaleString(L.locale);
 
         pieCharts[metric] = new Chart(document.getElementById(ids[i]), {
             type: 'doughnut',
@@ -878,7 +1104,7 @@ function renderPieCharts() {
                                 const t = ctx.dataset.data.reduce((s, v) => s + v, 0);
                                 const pct = t ? ((ctx.parsed / t) * 100).toFixed(1) : 0;
                                 return ctx.label + ': ' +
-                                    ctx.parsed.toLocaleString('cs-CZ') + ' (' + pct + '%)';
+                                    ctx.parsed.toLocaleString(L.locale) + ' (' + pct + '%)';
                             }
                         }
                     }
@@ -886,6 +1112,49 @@ function renderPieCharts() {
             }
         });
     });
+}
+
+function renderHeatmap() {
+    const el = document.getElementById('heatmap');
+    el.innerHTML = '';
+    const days = L.days;
+
+    // Sum heatmaps of active authors
+    const grid = Array.from({length: 7}, () => new Array(24).fill(0));
+    chartData.authors.filter(a => activeAuthors.has(a.name)).forEach(a => {
+        const hm = chartData.heatmap[a.name];
+        if (!hm) return;
+        for (let d = 0; d < 7; d++)
+            for (let h = 0; h < 24; h++)
+                grid[d][h] += hm[d][h];
+    });
+    const max = Math.max(1, ...grid.flat());
+
+    // Header row: hour labels every 3 hours
+    el.appendChild(document.createElement('div'));
+    for (let h = 0; h < 24; h++) {
+        const c = document.createElement('div');
+        c.className = 'hm-hour';
+        c.textContent = (h % 3 === 0) ? h : '';
+        el.appendChild(c);
+    }
+    for (let d = 0; d < 7; d++) {
+        const lbl = document.createElement('div');
+        lbl.className = 'hm-label';
+        lbl.textContent = days[d];
+        el.appendChild(lbl);
+        for (let h = 0; h < 24; h++) {
+            const cell = document.createElement('div');
+            cell.className = 'hm-cell';
+            const v = grid[d][h];
+            if (v > 0) {
+                const alpha = 0.15 + 0.85 * (v / max);
+                cell.style.background = 'rgba(78, 121, 167, ' + alpha.toFixed(2) + ')';
+            }
+            cell.title = days[d] + ' ' + h + ':00 — ' + v.toLocaleString(L.locale) + ' ' + L.commitsWord;
+            el.appendChild(cell);
+        }
+    }
 }
 
 init();
@@ -897,43 +1166,86 @@ init();
 
 # --- Main ---
 
+def resolve_repo_root(path):
+    try:
+        result = subprocess.run(
+            ['git', '-C', path, 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except FileNotFoundError:
+        print("Error: git not found in PATH.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError:
+        print(f"Error: '{path}' is not a git repository.", file=sys.stderr)
+        sys.exit(1)
+
+
+def db_path_for(repo_root, branch, pathspec):
+    key = '\0'.join([repo_root, branch or '--all'] + (pathspec or []))
+    digest = hashlib.sha1(key.encode()).hexdigest()[:12]
+    name = os.path.basename(repo_root) or 'repo'
+    return os.path.join(cache_dir(), f'{name}-{digest}.db')
+
+
+def create_server(port):
+    """Bind to requested port, or next free one within +49."""
+    ThreadingTCPServer.allow_reuse_address = True
+    for candidate in range(port, port + 50):
+        try:
+            return ThreadingTCPServer(('127.0.0.1', candidate), StatsHandler), candidate
+        except OSError:
+            continue
+    print(f"Error: no free port in range {port}-{port + 49}.", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Git Stats - Repository statistics viewer')
+    parser.add_argument('path', nargs='?', default='.',
+                        help='Path to git repository (default: current directory)')
     parser.add_argument('-p', '--port', type=int, default=8787, help='Port (default: 8787)')
     parser.add_argument('-n', '--no-browser', action='store_true', help="Don't open browser")
+    parser.add_argument('-b', '--branch', default=None,
+                        help='Scan only commits reachable from this ref (default: all refs)')
+    parser.add_argument('--pathspec', nargs='+', default=None, metavar='PATH',
+                        help='Limit stats to commits touching these paths (git pathspec)')
     parser.add_argument('--rescan', action='store_true', help='Force full rescan (clear cache)')
     args = parser.parse_args()
 
-    # Check git repo
-    try:
-        subprocess.run(['git', 'rev-parse', '--git-dir'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: Not a git repository. Run this from inside a git repo.", file=sys.stderr)
-        sys.exit(1)
+    repo_root = resolve_repo_root(args.path)
+    repo_name = os.path.basename(repo_root)
+    db_path = db_path_for(repo_root, args.branch, args.pathspec)
 
-    repo_name = get_repo_name()
-    db_path = os.path.join(DB_DIR, 'cache.db')
+    CONFIG['repo_root'] = repo_root
+    CONFIG['branch'] = args.branch
+    CONFIG['pathspec'] = args.pathspec
 
-    if args.rescan and os.path.exists(db_path):
-        os.remove(db_path)
+    if args.rescan:
+        for suffix in ('', '-wal', '-shm'):
+            if os.path.exists(db_path + suffix):
+                os.remove(db_path + suffix)
         print("Cache cleared.")
 
     print(f"Git Stats - {repo_name}")
-    print("Initializing...")
+    print(f"  Repo:  {repo_root}")
+    if args.branch:
+        print(f"  Ref:   {args.branch}")
+    if args.pathspec:
+        print(f"  Paths: {' '.join(args.pathspec)}")
+    print(f"  Cache: {db_path}")
     init_db(db_path)
 
-    # Configure handler
     StatsHandler.db_path = db_path
     StatsHandler.repo_name = repo_name
 
     # Start scan in background
-    scan_thread = threading.Thread(target=scan_repository, args=(db_path,), daemon=True)
-    scan_thread.start()
+    threading.Thread(target=scan_repository, args=(db_path,), daemon=True).start()
 
-    # Start server
-    ThreadingTCPServer.allow_reuse_address = True
-    server = ThreadingTCPServer(('127.0.0.1', args.port), StatsHandler)
-    url = f'http://127.0.0.1:{args.port}'
+    server, port = create_server(args.port)
+    if port != args.port:
+        print(f"  Port {args.port} busy, using {port}.")
+    url = f'http://127.0.0.1:{port}'
     print(f"Server: {url}")
 
     if not args.no_browser:
