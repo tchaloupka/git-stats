@@ -33,6 +33,8 @@
 - Aggregation moved from Python to SQL (`GROUP BY` in SQLite).
 
 ### Fixed
+- Changing `.mailmap` (or `mailmap.file`) now triggers an automatic full
+  rescan — cached author identities were stale until a manual `--rescan`.
 - Switching the period filter no longer resets the author filter — deactivated
   authors stay deactivated; authors newly appearing in the period start active.
 - Commits removed by rebase/force-push are pruned from the cache instead of

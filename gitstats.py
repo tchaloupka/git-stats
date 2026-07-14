@@ -134,6 +134,24 @@ def flush_block(lines, known, batch):
     batch.append((commit_hash, author, email, date_utc, tz_min, additions, deletions))
 
 
+def mailmap_fingerprint():
+    """Hash of mailmap sources; cached identities are stale when it changes."""
+    h = hashlib.sha1()
+    files = [os.path.join(CONFIG['repo_root'], '.mailmap')]
+    result = subprocess.run(
+        git_cmd('config', '--get', 'mailmap.file'), capture_output=True, text=True
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        files.append(os.path.expanduser(result.stdout.strip()))
+    for path in files:
+        try:
+            with open(path, 'rb') as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()
+
+
 def scan_repository(db_path, full=False):
     global scan_status
     with scan_lock:
@@ -144,9 +162,19 @@ def scan_repository(db_path, full=False):
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA journal_mode=WAL')
 
+    # Cached author identities go through .mailmap at scan time; a mailmap
+    # change (or a cache predating fingerprint tracking) invalidates them all
+    mailmap = mailmap_fingerprint()
+    row = conn.execute("SELECT value FROM meta WHERE key='mailmap'").fetchone()
+    has_commits = conn.execute('SELECT 1 FROM commits LIMIT 1').fetchone() is not None
+    if not full and has_commits and (row is None or row[0] != mailmap):
+        print("  Mailmap changed, full rescan...")
+        full = True
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('mailmap', ?)", (mailmap,))
+
     if full:
         conn.execute('DELETE FROM commits')
-        conn.commit()
+    conn.commit()
 
     known = set(r[0] for r in conn.execute('SELECT hash FROM commits'))
     if known:
